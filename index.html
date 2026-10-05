@@ -694,6 +694,9 @@ function isLegal(play, field, rev) {
   if (!field.plays.length) return true;
   const top = field.plays[field.plays.length - 1].play;
   if (!sameFormation(play, top)) return false;
+  // 場がジョーカー単体：♠3の単体だけが勝てる。場がジョーカーペア：何も勝てない。
+  // 縛り（階段縛り・マーク縛り）が残っていても、こちらを先に判定する
+  if (P.jokerOnly(top)) return beats(play, top, rev);
   if (P.jokerOnly(play)) return beats(play, top, rev);   // 縛りを無視できる唯一の例外
 
   const lock = field.lock;
