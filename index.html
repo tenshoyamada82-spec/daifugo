@@ -308,7 +308,7 @@
   .chip[aria-pressed="true"] { background: var(--felt); color: var(--felt-ink); border-color: var(--felt-edge); font-weight: 700; }
 
   /* --- スマホ ---------------------------------------------------------
-     親指で届く位置に手札を固定し、場と手札���同時に見える状態を保つ。
+     親指で届く位置に手札を固定し、場と手札が同時に見える状態を保つ。
      ログは下に流し、スクロールしても手札パネルは貼り付いたまま。 */
   @media (max-width: 640px) {
     :root { --card-w: 48px; --card-h: 66px; }
@@ -426,7 +426,7 @@
   </section>
 
   <section class="log-panel">
-    <h2>進行ログ</h2>
+    <h2 id="log-title">進行ログ</h2>
     <div class="log" id="log"></div>
   </section>
 </div>
@@ -795,13 +795,17 @@ class Game {
     this.roundNo = 0;
     this.lastPlaces = null;
     this.log = [];
+    this.trickNo = 0;        // ログを「場」単位で区切る番号（ラウンド開始と場が流れるたびに+1）
+    this.track = true;       // 手札読み用の記録をとる（先読み用のSimGameでは使わない）
+    this.reads = null;       // 人ごとの「最後に出した手」と「そのあとのパス」（公開情報だけ）
+    this.gifts = [];         // カード交換で渡した札（渡した本人は中身を知っている）
     this.onChange = () => {};
   }
 
   get rev() { return this.revolution !== this.eleven; }
   get active() { return this.players.filter(p => !p.finished).map(p => p.idx); }
 
-  say(text, cls = "") { this.log.push({ text, cls }); this.onChange(); }
+  say(text, cls = "") { this.log.push({ text, cls, trick: this.trickNo }); this.onChange(); }
 
   ringFrom(from) {
     const n = this.players.length, out = [];
@@ -826,6 +830,16 @@ class Game {
   remainingTotal() {
     return this.players.filter(p => !p.finished)
       .reduce((a, p) => a + p.hand.length + p.stock.length, 0);
+  }
+
+  // 手札読み用：その時点の場・強さ・枚数（全員に見えている情報）
+  readSnap(i, extra) {
+    const p = this.players[i];
+    return Object.assign({
+      field: { plays: this.field.plays.slice(), lock: this.field.lock },
+      revolution: this.revolution, eleven: this.eleven,
+      handLen: p.hand.length, stockLen: p.stock.length,
+    }, extra);
   }
 
   /* --- 準備 --- */
@@ -857,6 +871,7 @@ class Game {
 
   setupRound() {
     this.roundNo++;
+    this.trickNo++;
     this.field = { plays: [], lock: NO_LOCK };
     this.revolution = false;   // 革命はラウンドを越えて持ち越さない
     this.eleven = false;
@@ -865,12 +880,15 @@ class Game {
     this.finishOrder = [];
     this.foulOrder = [];
     this.tailOrder = [];
+    if (this.track) this.gifts = [];
     this.say(`第${this.roundNo}ラウンド`, "rnd");
     this.deal();
   }
 
   async decideParent() {
-    if (this.lastPlaces) {
+    // 2人プレイは毎ラウンド、手札の一番弱い札を申告して親を決める（2026-10-06 確定）。
+    // 3〜4人は2ラウンド目から前ラウンド1位が親
+    if (this.lastPlaces && this.players.length > 2) {
       const w = this.players.find(p => this.lastPlaces[p.idx] === 1);
       this.say(`親：前ラウンド1位の ${w.name}`, "flow");
       return w.idx;
@@ -923,6 +941,8 @@ class Game {
       for (const c of down) hp.hand.splice(hp.hand.findIndex(x => x.uid === c.uid), 1);
       lp.hand.push(...down); hp.hand.push(...up);
       sortHand(lp.hand); sortHand(hp.hand);
+      if (this.track) this.gifts.push({ from: low, to: high, uids: up.map(c => c.uid) },
+                                      { from: high, to: low, uids: down.map(c => c.uid) });
       this.say(`　${lp.name} → ${hp.name}：${up.map(cardName).join(" ")}（強いカード強制）`, "flow");
       this.say(`　${hp.name} → ${lp.name}：${down.map(cardName).join(" ")}`, "flow");
     }
@@ -943,6 +963,7 @@ class Game {
     this.winner = null; this.winPlay = null; this.snapshot = null;
     this.stuck = 0;
     this.lastTotal = this.remainingTotal(); this.noProgress = 0; this.guard = 0;
+    if (this.track) this.reads = this.players.map(() => ({ last: null, passes: [] }));
   }
 
   // 1手を適用する。上がりが出たらその時点の残り枚数を記録する
@@ -1035,10 +1056,20 @@ class Game {
   }
 
   async doPlay(i, play) {
+    const snap = this.reads ? this.readSnap(i, { play }) : null;
     const np = await this.playStart(i, play);
     const nd = P.rankCount(play, 10);
     if (nd) await this.tenDiscard(i, nd, play, np);
-    return this.playEnd(i, play, np);
+    const won = this.playEnd(i, play, np);
+    if (snap) {
+      // 手札が入れ替わったので、前の記録は捨てる。
+      // 10捨て・12拾い・上がりのない「ふつうの1手」だけ、出す前の手札を逆算できるので残す
+      const p = this.players[i];
+      const clean = !np && !nd && !p.finished;
+      if (clean) snap.drawn = p.hand.length - (snap.handLen - play.cards.length);
+      this.reads[i] = { last: clean ? snap : null, passes: [] };
+    }
+    return won;
   }
 
   // 出した直後〜補充まで（革命・イレブンバック・12拾い・補充）
@@ -1087,7 +1118,7 @@ class Game {
     } else if (np && !p.stock.length && p.hand.length === 1 && lastCardBad(p.hand[0])) {
       p.finished = true;
       this.foulOrder.push(i);
-      this.say(`　反則上がり：${p.name} は12で拾った ${cardName(p.hand[0])} が最後の1枚になり、上が��ないため最下位が確定`, "ev");
+      this.say(`　反則上がり：${p.name} は12で拾った ${cardName(p.hand[0])} が最後の1枚になり、上がれないため最下位が確定`, "ev");
     }
     this.resolveTurnAfterPlay(i, play);
     return won;
@@ -1155,6 +1186,8 @@ class Game {
       return;
     }
     p.passed = true;
+    // パスしてから次に出すまで手札は変わらないので、読みの材料として残す
+    if (this.reads) this.reads[i].passes.push(this.readSnap(i, { had: hadOptions }));
     this.say(`${p.name}：パス${hadOptions ? "" : "（出せる手なし）"}`,
              i === 0 ? "me" : "flow");
     this.advanceNoAction(i);
@@ -1215,6 +1248,7 @@ class Game {
       parent = ring.length ? ring[0] : parent;
       this.say(`　上がった人の次、${this.players[parent].name} が親`, "flow");
     }
+    this.trickNo++;
     this.turn = parent;
   }
 }
@@ -1301,11 +1335,13 @@ class ComAgent {
 }
 
 /* ============================================================
-   最強COM（2人プレイ用）
+   最強COM（2〜4人プレイ）
    考え方：見えていない札（相手の手札・山札、自分の山札）を「ありうる配り方」で
    何十通りも作り、それぞれで候補の手をラウンドの最後まで打ち切ってみる。
-   得点の平均が一番よい手を選ぶ。評価は「自分の得点 − 相手の得点」（勝率×得点）。
+   得点の平均が一番よい手を選ぶ。評価は「自分が1位でもらう得点 − 自分が最下位で取られる得点」
+   （勝率×得点）。2人プレイなら「自分の得点 − 相手の得点」と同じ。
    順位は見ない。相手の札はのぞかない（公開情報だけを使う）。
+   強さ「つよい」は、配り直すときに相手のパスや出し方と合う配り方を選ぶ（手札読み）。
    ============================================================ */
 const SIM_LOG = false;
 const nowMs = () => (typeof performance !== "undefined" ? performance.now() : Date.now());
@@ -1413,15 +1449,69 @@ function cloneForSim(g, agents) {
   return s;
 }
 
+/* ---------- 手札読み（強さ「つよい」） ----------
+   相手が最後に出した手と、そのあとのパスは全員に見えている。
+   配り直した手札がその行動と合うかを点数（0〜1）にして、合わない配り方ははじく。
+   ・「パス（出せる手なし）」：その場に出せる手を持っていない（確実な情報）
+   ・出せたのにパス：速いCOMならここで出すような手札は、ありそうにない
+   ・出した手：出す前の手札（今の手札−補充した札＋出した札）で、速いCOMも同じ手を選ぶか
+   ・カード交換で自分が渡した札：まだ出ていなければ、渡した相手の手札にある */
+const READ = { eps: 0.02, softPass: 0.35, softPlay: 0.5, tries: 40 };
+const playKey = p => p.kind + ":" + p.cards.map(c => c.uid).sort().join(",");
+
+// 過去の時点の場・強さ・枚数で、仮の手札を持っていたことにした局面
+function snapView(g, j, hand, snap) {
+  const v = Object.create(g);
+  v.field = snap.field; v.revolution = snap.revolution; v.eleven = snap.eleven;
+  const pj = Object.assign({}, g.players[j], { hand, stock: { length: snap.stockLen } });
+  v.players = g.players.map((p, k) => (k === j ? pj : p));
+  return v;
+}
+
+function readLikelihood(g, j, hand, cand, obs, quick) {
+  let w = 1;
+  for (const ps of obs.passes) {
+    const opts = legalPlays(hand, ps.field, ps.revolution !== ps.eleven);
+    if (!ps.had) { if (opts.length) w *= READ.eps; continue; }
+    if (!opts.length) { w *= READ.eps; continue; }
+    if (quick.choosePlay(snapView(g, j, hand, ps), j, opts)) w *= READ.softPass;
+  }
+  const L = obs.last;
+  if (L) {
+    // cand はランダムな順なので、先頭の drawn 枚を「出したあとに補充した札」とみなす
+    const d = Math.min(Math.max(L.drawn || 0, 0), cand.length);
+    const drawn = new Set(cand.slice(0, d).map(c => c.uid));
+    const before = hand.filter(c => !drawn.has(c.uid)).concat(L.play.cards);
+    sortHand(before);
+    const opts = legalPlays(before, L.field, L.revolution !== L.eleven);
+    const c = opts.length ? quick.choosePlay(snapView(g, j, before, L), j, opts) : null;
+    if (!c || playKey(c) !== playKey(L.play)) w *= READ.softPlay;
+  }
+  return w;
+}
+
+// rest の先頭 need 枚をランダムに選び直す（部分シャッフル）
+function pickHand(rest, need) {
+  for (let t = 0; t < need; t++) {
+    const r = t + Math.floor(Math.random() * (rest.length - t));
+    const x = rest[t]; rest[t] = rest[r]; rest[r] = x;
+  }
+  return rest.slice(0, need);
+}
+
 // 見えていない札をランダムに配り直した「ありうる局面」を作る。
-// 自分の手札・捨札・場・12で拾われて公開された札だけはそのまま使う
-function determinize(g, me) {
+// 自分の手札・捨札・場・12で拾われて公開された札だけはそのまま使う。
+// quick を渡すと手札読みをする（強さ「つよい」）
+function determinize(g, me, quick = null) {
   const s = cloneForSim(g, null);
+  const read = !!(quick && g.reads);
+  const mine = new Set();
+  if (read && g.gifts) for (const x of g.gifts) if (x.from === me) for (const u of x.uids) mine.add(u);
   const known = new Map();
   const knownUid = new Set();
   for (const p of g.players) {
     if (p.idx === me) continue;
-    const k = p.hand.filter(c => g.revealed.has(c.uid));
+    const k = p.hand.filter(c => g.revealed.has(c.uid) || mine.has(c.uid));
     known.set(p.idx, k);
     for (const c of k) knownUid.add(c.uid);
   }
@@ -1430,21 +1520,49 @@ function determinize(g, me) {
     const cards = p.idx === me ? p.stock : p.hand.concat(p.stock);
     for (const c of cards) if (!knownUid.has(c.uid)) pool.push(c);
   }
-  for (let i = pool.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    const t = pool[i]; pool[i] = pool[j]; pool[j] = t;
+  const shuffle = arr => {
+    for (let i = arr.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      const t = arr[i]; arr[i] = arr[j]; arr[j] = t;
+    }
+  };
+  shuffle(pool);
+  let rest = pool;
+  const hands = new Map();
+  if (read) {
+    // 読みの材料がある相手から、行動と合う手札を選ぶ
+    for (const sp of s.players) {
+      if (sp.idx === me) continue;
+      const obs = g.reads[sp.idx];
+      const kn = known.get(sp.idx), need = sp.hand.length - kn.length;
+      if (!obs || (!obs.last && !obs.passes.length) || need <= 0) continue;
+      let best = null, bw = -1;
+      for (let t = 0; t < READ.tries; t++) {
+        const cand = pickHand(rest, need);
+        const w = readLikelihood(g, sp.idx, kn.concat(cand), cand, obs, quick);
+        if (w > bw) { bw = w; best = cand; }
+        if (Math.random() < w) { best = cand; break; }
+      }
+      const used = new Set(best.map(c => c.uid));
+      rest = rest.filter(c => !used.has(c.uid));
+      hands.set(sp.idx, kn.concat(best));
+    }
+    shuffle(rest);
   }
   let k = 0;
   for (const sp of s.players) {
     if (sp.idx === me) {
-      sp.stock = pool.slice(k, k + sp.stock.length); k += sp.stock.length;
+      sp.stock = rest.slice(k, k + sp.stock.length); k += sp.stock.length;
       continue;
     }
-    const kn = known.get(sp.idx);
-    const need = sp.hand.length - kn.length;
-    sp.hand = kn.concat(pool.slice(k, k + need)); k += need;
+    if (hands.has(sp.idx)) sp.hand = hands.get(sp.idx);
+    else {
+      const kn = known.get(sp.idx);
+      const need = sp.hand.length - kn.length;
+      sp.hand = kn.concat(rest.slice(k, k + need)); k += need;
+    }
     sortHand(sp.hand);
-    sp.stock = pool.slice(k, k + sp.stock.length); k += sp.stock.length;
+    sp.stock = rest.slice(k, k + sp.stock.length); k += sp.stock.length;
   }
   return s;
 }
@@ -1458,11 +1576,13 @@ class MasterAgent {
     this.delay = opts.delay ?? 250;
     this.objective = opts.objective ?? "net"; // net：自分−相手／own：自分の得点のみ
     this.quick = opts.quick ?? new QuickAgent();
+    this.read = opts.read ?? false;            // true：相手のパスや出し方から手札を読む（つよい）
     this.lastStats = null;
   }
   value(res, me, n) {
     if (res.winner === me) return res.score;
-    return (this.objective === "net" && n === 2) ? -res.score : 0;
+    // 得点は1位が最下位からもらう。自分が最下位なら取られる分をマイナスに数える
+    return (this.objective === "net" && res.places[me] === n) ? -res.score : 0;
   }
   async search(game, me, cands, apply) {
     const t0 = nowMs();
@@ -1470,7 +1590,7 @@ class MasterAgent {
     const tot = new Float64Array(cands.length);
     let n = 0, lastYield = t0;
     while (n < this.maxSamples) {
-      const det = determinize(game, me);
+      const det = determinize(game, me, this.read ? this.quick : null);
       for (let k = 0; k < cands.length; k++) {
         const s = cloneForSim(det, agents);
         apply(s, cands[k]);
@@ -1553,6 +1673,10 @@ class SimGame {
     this.roundNo = 0;
     this.lastPlaces = null;
     this.log = [];
+    this.trickNo = 0;        // ログを「場」単位で区切る番号（ラウンド開始と場が流れるたびに+1）
+    this.track = true;       // 手札読み用の記録をとる（先読み用のSimGameでは使わない）
+    this.reads = null;       // 人ごとの「最後に出した手」と「そのあとのパス」（公開情報だけ）
+    this.gifts = [];         // カード交換で渡した札（渡した本人は中身を知っている）
     this.onChange = () => {};
   }
 
@@ -1586,6 +1710,16 @@ class SimGame {
       .reduce((a, p) => a + p.hand.length + p.stock.length, 0);
   }
 
+  // 手札読み用：その時点の場・強さ・枚数（全員に見えている情報）
+  readSnap(i, extra) {
+    const p = this.players[i];
+    return Object.assign({
+      field: { plays: this.field.plays.slice(), lock: this.field.lock },
+      revolution: this.revolution, eleven: this.eleven,
+      handLen: p.hand.length, stockLen: p.stock.length,
+    }, extra);
+  }
+
   /* --- 準備 --- */
   deal() {
     const deck = makeDeck();
@@ -1615,6 +1749,7 @@ class SimGame {
 
   setupRound() {
     this.roundNo++;
+    this.trickNo++;
     this.field = { plays: [], lock: NO_LOCK };
     this.revolution = false;   // 革命はラウンドを越えて持ち越さない
     this.eleven = false;
@@ -1623,12 +1758,15 @@ class SimGame {
     this.finishOrder = [];
     this.foulOrder = [];
     this.tailOrder = [];
+    if (this.track) this.gifts = [];
     SIM_LOG && this.say(`第${this.roundNo}ラウンド`, "rnd");
     this.deal();
   }
 
   decideParent() {
-    if (this.lastPlaces) {
+    // 2人プレイは毎ラウンド、手札の一番弱い札を申告して親を決める（2026-10-06 確定）。
+    // 3〜4人は2ラウンド目から前ラウンド1位が親
+    if (this.lastPlaces && this.players.length > 2) {
       const w = this.players.find(p => this.lastPlaces[p.idx] === 1);
       SIM_LOG && this.say(`親：前ラウンド1位の ${w.name}`, "flow");
       return w.idx;
@@ -1681,6 +1819,8 @@ class SimGame {
       for (const c of down) hp.hand.splice(hp.hand.findIndex(x => x.uid === c.uid), 1);
       lp.hand.push(...down); hp.hand.push(...up);
       sortHand(lp.hand); sortHand(hp.hand);
+      if (this.track) this.gifts.push({ from: low, to: high, uids: up.map(c => c.uid) },
+                                      { from: high, to: low, uids: down.map(c => c.uid) });
       SIM_LOG && this.say(`　${lp.name} → ${hp.name}：${up.map(cardName).join(" ")}（強いカード強制）`, "flow");
       SIM_LOG && this.say(`　${hp.name} → ${lp.name}：${down.map(cardName).join(" ")}`, "flow");
     }
@@ -1701,6 +1841,7 @@ class SimGame {
     this.winner = null; this.winPlay = null; this.snapshot = null;
     this.stuck = 0;
     this.lastTotal = this.remainingTotal(); this.noProgress = 0; this.guard = 0;
+    if (this.track) this.reads = this.players.map(() => ({ last: null, passes: [] }));
   }
 
   // 1手を適用する。上がりが出たらその時点の残り枚数を記録する
@@ -1793,10 +1934,20 @@ class SimGame {
   }
 
   doPlay(i, play) {
+    const snap = this.reads ? this.readSnap(i, { play }) : null;
     const np = this.playStart(i, play);
     const nd = P.rankCount(play, 10);
     if (nd) this.tenDiscard(i, nd, play, np);
-    return this.playEnd(i, play, np);
+    const won = this.playEnd(i, play, np);
+    if (snap) {
+      // 手札が入れ替わったので、前の記録は捨てる。
+      // 10捨て・12拾い・上がりのない「ふつうの1手」だけ、出す前の手札を逆算できるので残す
+      const p = this.players[i];
+      const clean = !np && !nd && !p.finished;
+      if (clean) snap.drawn = p.hand.length - (snap.handLen - play.cards.length);
+      this.reads[i] = { last: clean ? snap : null, passes: [] };
+    }
+    return won;
   }
 
   // 出した直後〜補充まで（革命・イレブンバック・12拾い・補充）
@@ -1845,7 +1996,7 @@ class SimGame {
     } else if (np && !p.stock.length && p.hand.length === 1 && lastCardBad(p.hand[0])) {
       p.finished = true;
       this.foulOrder.push(i);
-      SIM_LOG && this.say(`　反則上がり：${p.name} は12で拾った ${cardName(p.hand[0])} が最後の1枚になり、上が��ないため最下位が確定`, "ev");
+      SIM_LOG && this.say(`　反則上がり：${p.name} は12で拾った ${cardName(p.hand[0])} が最後の1枚になり、上がれないため最下位が確定`, "ev");
     }
     this.resolveTurnAfterPlay(i, play);
     return won;
@@ -1913,6 +2064,8 @@ class SimGame {
       return;
     }
     p.passed = true;
+    // パスしてから次に出すまで手札は変わらないので、読みの材料として残す
+    if (this.reads) this.reads[i].passes.push(this.readSnap(i, { had: hadOptions }));
     SIM_LOG && this.say(`${p.name}：パス${hadOptions ? "" : "（出せる手なし）"}`,
              i === 0 ? "me" : "flow");
     this.advanceNoAction(i);
@@ -1973,6 +2126,7 @@ class SimGame {
       parent = ring.length ? ring[0] : parent;
       SIM_LOG && this.say(`　上がった人の次、${this.players[parent].name} が親`, "flow");
     }
+    this.trickNo++;
     this.turn = parent;
   }
 }
@@ -1982,6 +2136,8 @@ class SimGame {
    ============================================================ */
 const el = id => document.getElementById(id);
 let game = null;
+let comLevel = "strong";  // COMの強さ：weak／normal／strong
+let logLimit = 0;        // 進行ログ：0 = 全部見える／4 = 今の場を含めて直近4場だけ
 let pending = null;      // { options, resolve } 人間の着手待ち
 let selected = new Set();
 
@@ -2214,7 +2370,17 @@ function renderHand() {
 function renderLog() {
   const box = el("log");
   box.innerHTML = "";
-  for (const entry of game.log.slice(-160)) {
+  const title = el("log-title");
+  if (title) title.textContent = logLimit ? `進行ログ（直近${logLimit}場だけ）` : "進行ログ";
+  // 直近モード：今の場を含めて logLimit 場ぶんだけ見せる。それより前は消える
+  const from = logLimit ? game.trickNo - logLimit + 1 : -Infinity;
+  const shown = logLimit ? game.log.filter(e => (e.trick ?? 0) >= from) : game.log;
+  if (logLimit && shown.length < game.log.length) {
+    const d = document.createElement("div");
+    d.className = "flow"; d.textContent = "……これより前の場はもう見えません";
+    box.append(d);
+  }
+  for (const entry of shown.slice(-160)) {
     const d = document.createElement("div");
     d.className = entry.cls; d.textContent = entry.text;
     box.append(d);
@@ -2370,6 +2536,18 @@ function showResult(result) {
   });
 }
 
+// COMの強さ（3段階）
+const COM_LEVELS = {
+  weak:   { label: "よわい", note: "よわい：今の1手だけを見て決めます（旧COM）。" },
+  normal: { label: "ふつう", note: "ふつう：見えない札をランダムに配り直し、ラウンドの最後まで先読みします（1手に約1秒）。" },
+  strong: { label: "つよい", note: "つよい：ふつうの先読みに加えて、相手のパスや出し方から手札を読みます（1手に約1.6秒）。" },
+};
+const makeComFor = level =>
+  level === "weak" ? new ComAgent()
+  // つよい：読みのぶん考える時間を長くして、試す配り方の数をふつうと同じくらいにする
+  : level === "strong" ? new MasterAgent({ read: true, budgetMs: 1600 })
+  : new MasterAgent();
+
 function showSetup() {
   return showModal((modal, done) => {
     let n = 3;
@@ -2389,11 +2567,48 @@ function showSetup() {
     });
     const note = document.createElement("p");
     note.style.cssText = "font-size:12px;opacity:.75;margin:0";
-    note.textContent = "2人プレイの相手は最強COMです（1手に約1秒考えます）。";
+    note.textContent = "COMの強さは下で選べます。";
+    const label = t => {
+      const x = document.createElement("p");
+      x.style.cssText = "font-size:12px;font-weight:700;margin:4px 0 0";
+      x.textContent = t; return x;
+    };
+    let lim = logLimit;
+    const logRow = document.createElement("div"); logRow.className = "setup-row";
+    const logChips = [];
+    [[0, "全部見える"], [4, "直近4場だけ"]].forEach(([k, t]) => {
+      const b = document.createElement("button");
+      b.className = "chip"; b.type = "button"; b.textContent = t;
+      b.setAttribute("aria-pressed", String(k === lim));
+      b.addEventListener("click", () => {
+        lim = k; logChips.forEach(c => c.setAttribute("aria-pressed", String(c === b)));
+      });
+      logChips.push(b); logRow.append(b);
+    });
+    const logNote = document.createElement("p");
+    logNote.style.cssText = "font-size:12px;opacity:.75;margin:0";
+    logNote.textContent = "「直近4場だけ」は、今の場を含めて4場より前のログが消えます。相手が出した札を覚えておく練習用です。";
+    let lv = comLevel;
+    const lvRow = document.createElement("div"); lvRow.className = "setup-row";
+    const lvChips = [];
+    const lvNote = document.createElement("p");
+    lvNote.style.cssText = "font-size:12px;opacity:.75;margin:0";
+    const showLv = () => { lvNote.textContent = COM_LEVELS[lv].note; };
+    Object.entries(COM_LEVELS).forEach(([k, v]) => {
+      const b = document.createElement("button");
+      b.className = "chip"; b.type = "button"; b.textContent = v.label;
+      b.setAttribute("aria-pressed", String(k === lv));
+      b.addEventListener("click", () => {
+        lv = k; lvChips.forEach(c => c.setAttribute("aria-pressed", String(c === b))); showLv();
+      });
+      lvChips.push(b); lvRow.append(b);
+    });
+    showLv();
     const ok = document.createElement("button");
     ok.className = "btn btn-primary"; ok.type = "button"; ok.textContent = "はじめる";
-    ok.addEventListener("click", () => done(n));
-    modal.append(h, p, row, note, ok);
+    ok.addEventListener("click", () => done({ n, logLimit: lim, level: lv }));
+    modal.append(h, p, label("人数"), row, label("COMの強さ"), lvRow, lvNote,
+                 label("進行ログ"), logRow, logNote, ok);
   });
 }
 
@@ -2427,10 +2642,13 @@ let running = false;
 async function startApp() {
   if (running) return;
   running = true;
-  const n = await showSetup();
+  const setup = await showSetup();
+  const n = setup.n;
+  logLimit = setup.logLimit;
+  comLevel = setup.level || "strong";
   const names = ["あなた"].concat([...Array(n - 1).keys()].map(i => `COM${i + 1}`));
-  // 2人プレイの相手は最強COM（先読みで得点の期待値が一番高い手を選ぶ）
-  const makeCom = () => (n === 2 ? new MasterAgent() : new ComAgent());
+  // COMの強さは開始画面で選ぶ（全員同じ強さ）
+  const makeCom = () => makeComFor(comLevel);
   const agents = [new HumanAgent()].concat([...Array(n - 1)].map(makeCom));
   game = new Game(names, agents);
   game.onChange = render;
